@@ -1,0 +1,11 @@
+{"menu": {
+  "id": "file",
+  "type": "Word document",
+  "popup": {
+    "menuitem": [
+      {"value": "New", "onclick": "CreateNewDoc", "args": [null, true, false, "\u042Fndex" ] },
+      {"value": "Open", "onclick": "OpenDoc", "args": [1, "some text", 3.1415926] },
+      {"value": "Close", "onclick": "CloseDoc"}
+    ],
+  },
+}}
