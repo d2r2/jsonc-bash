@@ -3,16 +3,14 @@
 #
 # MIT License
 #
-# Copyright (c) 2021 Denis Dyakov <denis.dyakov@gma**.com>
+# Copyright (c) 2021-2024 Denis Dyakov <denis.dyakov@gma**.com>
 #
 # Inspired by minimalistic JSON parser written
 # by Serge Zaitsev: https://github.com/zserge/jsmn.
 # This code can be considered rewritten from
 # the original project with some modifications.
 #
-# Support standard JSON, as well as its superset -
-# JSONC (JSON with comments). Parsing comply with
-# JSON standard and allow comments (JSONC extension).
+# Support parsing of regular JSON, as well as JSONC (JSON with comments).
 #
 
 # Success
@@ -21,9 +19,16 @@ JSON_EXIT_OK=0
 JSON_EXIT_ERROR_INVAL=1
 # The string is not a full JSON packet, more bytes expected
 JSON_EXIT_ERROR_PART=2
+# Source file never parsed error
+JSON_EXIT_NEVER_PARSED=10
 	
+# Flag to identify that source file parsed
+JSON_EVER_PARSED=0
 # Point to the line in case of parse error result
 JSON_LINE_ERROR=0
+
+# Flag to print warning if XPath search contains invalid array index
+JSON_WARN_INVALID_PATH_INDEX=1
 
 # Tokens info which keep all information about parsed JSON structure.
 # These variables are used to traverse and search keys,
@@ -31,7 +36,8 @@ JSON_LINE_ERROR=0
 jt_type=()      # type (object, array, string, primitive)
 jt_content=()   # content for strings and primitives
 jt_parent=()    # reference to parent token
-jt_size=()      # number of children tokens
+jt_size=()      # count of direct children subtrees in json structure
+jt_size_tok=()	# total number of all child tokens
 
 # Get character from ASCII code
 # Taken from here:
@@ -105,7 +111,7 @@ read_string()
 	return $JSON_EXIT_ERROR_PART
 } # read_string
 
-# Parse JSON file from pipe to tokens.
+# Parse JSON/JSONC file data from pipe to tokens.
 # There are 4 token types only for JSON: object, array, string and primitive.
 # Tokens are stored in one dimention array, but jt_parent and jt_size arrays
 # help travers JSON structure in binary tree data structure manner.
@@ -117,17 +123,24 @@ parse_json_from_pipe()
 	local skip_comments="0"
 	# Next token index
 	local tok_pos=0
-	# Super token
-	local tok_sup=-1
+	# Position of parent token, which own current token
+	local parent_pos=-1
 	# Clear global arrays
 	jt_type=()      # type (object, array, string, primitive)
 	jt_content=()   # content for strings and primitives
 	jt_parent=()    # reference to parent token
-	jt_size=()      # number of children tokens
-	# Makes sure that all opening brackets ({[) have matching closing brackets (}])
-	local t_closed=()
+	jt_size=()      # count of direct children subtrees in json structure
+	jt_size_tok=()	# total number of all child tokens
+	
+	local t_stack=() # Save start token position for nested objects
+	
+	#local debug=true
 
-	# Read line by line from pipe
+	# Set parse attempt was implemented
+	JSON_EVER_PARSED=1
+
+	# Start read LINE loop from input pipe.
+	# Read line by line from pipe.
 	local line; while IFS= read -r line || [ -n "$line" ]; do
 
 		#echo "$line"
@@ -143,7 +156,8 @@ parse_json_from_pipe()
 		fi
 		skip_comments="0"
 
-		# Read char by char from nested pipe
+		# Start read CHAR loop from input LINE.
+		# Read char by char from nested pipe, which is line.
 		local buf_ch; while read -r -n1 buf_ch; do
 	
 			local read_char=1
@@ -164,20 +178,29 @@ parse_json_from_pipe()
 					jt_type+=($type)
 					jt_content+=("")
 					jt_size+=(0)
+					jt_size_tok+=(-1)
 					jt_parent+=(-1)
+
+					t_stack+=($tok_pos)
 			
-					if [[ $tok_sup -ne -1 ]]; then
-						# An object can't become a key
-						if [[ ${jt_type[$tok_sup]} == "o" ]]; then
+					if [[ $parent_pos -ne -1 ]]; then
+						# Parent token can't be an object
+						if [[ ${jt_type[$parent_pos]} == "o" ]]; then
+							[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: an object can't become a key" 1>&2
+							JSON_LINE_ERROR=$line_ind
+							return $JSON_EXIT_ERROR_INVAL
+						# If parent element is a string, than it size must be no more than 1,
+						# otherwise it means, that probably comma is missing
+						elif [[ ${jt_type[$parent_pos]} == "s" && ${jt_size[$parent_pos]} -gt 0 ]]; then
+							[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: probably comma is missing" 1>&2
 							JSON_LINE_ERROR=$line_ind
 							return $JSON_EXIT_ERROR_INVAL
 						fi
-						jt_size[$tok_sup]=$(( jt_size[$tok_sup] + 1 ))
-						jt_parent[$tok_pos]=$tok_sup
+						jt_size[$parent_pos]=$(( ${jt_size[$parent_pos]} + 1 ))
+						jt_parent[$tok_pos]=$parent_pos
 					fi
-			
-					t_closed+=(0)
-					tok_sup=$tok_pos
+
+					parent_pos=$tok_pos
 
 					tok_pos=$(( $tok_pos + 1 ))
 		
@@ -187,45 +210,44 @@ parse_json_from_pipe()
 			
 					local type; [[ "$ch" == "}" ]] && type="o" || type="a" # token object/array
 
-					if [[ $tok_pos -eq 0 ]]; then
+					local stack_depth=${#t_stack[@]}
+
+					if [[ $stack_depth -eq 0 ]]; then
 						#echo "ERROR }1"
+						[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: [{ more than }]" 1>&2
 						JSON_LINE_ERROR=$line_ind
-						return $JSON_EXIT_ERROR_INVAL
+						return $JSON_EXIT_ERROR_PART
 					fi
 
-					local tok_pos2=$(( $tok_pos - 1 ))
-					while [[ $tok_pos2 -ge 0 ]]; do
-						if [[ ${t_closed[$tok_pos2]} -eq 0 ]]; then
-							if [[ ${jt_type[$tok_pos2]} != $type ]]; then
-								#echo "ERROR }2"
-								JSON_LINE_ERROR=$line_ind
-								return $JSON_EXIT_ERROR_INVAL
-							fi
+					local sup_start=${t_stack[$(( $stack_depth - 1 ))]}
+					parent_pos=${jt_parent[$sup_start]}
 
-							t_closed[$tok_pos2]=1
-							tok_sup=${jt_parent[$tok_pos2]}
-							break
-						fi
+					if [[ "${jt_type[$sup_start]}" != "$type" ]]; then
+						[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: open ${jt_type[$sup_start]} do not match close $type" 1>&2
+						JSON_LINE_ERROR=$line_ind
+						return $JSON_EXIT_ERROR_PART
+					fi
 
-						if [[ ${jt_parent[$tok_pos2]} -eq -1 ]]; then
-							if [[ ${jt_type[$tok_pos2]} != $type || $tok_sup -eq -1 ]]; then
-								#echo "ERROR }3"
-								JSON_LINE_ERROR=$line_ind
-								return $JSON_EXIT_ERROR_INVAL
-							fi
-							break
-						fi
-						tok_pos2=${jt_parent[$tok_pos2]}
-					done
+					#echo "sup_start=$sup_start; sup_end=$tok_pos; parent_pos=$parent_pos; stack=${t_stack[@]}" 1>&2
+					local tok_size=$(( $tok_pos - $sup_start ))
+					jt_size_tok[$sup_start]=$tok_size
 
+					# remove last element of array
+					unset 't_stack[${#t_stack[@]}-1]'
+
+					if [[ $parent_pos -ne -1 && ${jt_type[$parent_pos]} != "o" && ${jt_type[$parent_pos]} != "a" ]]; then
+						jt_size_tok[$parent_pos]=$(( ${jt_size_tok[$parent_pos]} + $tok_size ))					
+					fi					
+		
 				# Skip space characters
 				elif [[ "$ch" =~ [[[:space:]]] || "$ch" == "" || "$ch" == "\r" || "$ch" == "\n" || "$ch" == "\t" ]]; then
 					#echo "space" 1>&2
 					:
 
-				# Start of comment block
+				# Start of multiline comment block
 				elif [[ "$ch" == "/" ]]; then
 					if ! read -r -n1 ch; then
+						[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: unexpected comment / end" 1>&2
 						JSON_LINE_ERROR=$line_ind
 						return $JSON_EXIT_ERROR_INVAL
 					fi
@@ -240,6 +262,7 @@ parse_json_from_pipe()
 						break
 					else
 						# Unexpected char
+						[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: unexpected char for comment /" 1>&2
 						JSON_LINE_ERROR=$line_ind
 						return $JSON_EXIT_ERROR_INVAL
 					fi
@@ -247,9 +270,17 @@ parse_json_from_pipe()
 				elif [[ "$ch" == "\"" ]]; then
 					#echo "string" 1>&2
 
+					# If parent element is a string, than it size must be no more than 1,
+					# otherwise it means, that probably comma is missing
+					if [[ $parent_pos -ne -1 && ${jt_type[$parent_pos]} == "s" && ${jt_size[$parent_pos]} -gt 0 ]]; then
+						JSON_LINE_ERROR=$line_ind
+						return $JSON_EXIT_ERROR_PART
+					fi
+
 					# Skip opening quote
 					read_string "$pos"; local retval=$?; local val="$read_string_res"
 					if [[ $retval -ne $JSON_EXIT_OK ]]; then
+						[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: problem with reading string" 1>&2
 						JSON_LINE_ERROR=$line_ind
 						return $retval
 					fi
@@ -259,25 +290,33 @@ parse_json_from_pipe()
 					jt_type+=("s")
 					jt_content+=("$val")
 					jt_size+=(0)
-					t_closed+=(1)
-					jt_parent+=($tok_sup)
+					jt_size_tok+=(1)
+					jt_parent+=($parent_pos)
 			
-					[[ $tok_sup -ne -1 ]] && jt_size[$tok_sup]=$(( jt_size[$tok_sup] + 1 ))
+					if [[ $parent_pos -ne -1 ]]; then
+						jt_size[$parent_pos]=$(( ${jt_size[$parent_pos]} + 1 ))
+						local tok_size=$(( $tok_pos - $parent_pos ))
+						jt_size_tok[$parent_pos]=$(( ${jt_size_tok[$parent_pos]} + $tok_size ))
+					fi
 			
 					tok_pos=$(( $tok_pos + 1 ))
+
 				elif [[ "$ch" == ":" ]]; then
 					#echo "divider" 1>&2
-					tok_sup=$(( $tok_pos - 1 ))
+					parent_pos=$(( $tok_pos - 1 ))
+
 				elif [[ "$ch" == "," ]]; then
 					#echo "comma" 1>&2
-					[[ $tok_sup -ne -1 ]] && [[ ${jt_type[$tok_sup]} != "o" && ${jt_type[$tok_sup]} != "a" ]] && \
-						tok_sup=${jt_parent[$tok_sup]}
+					if [[ $parent_pos -ne -1 && ${jt_type[$parent_pos]} != "o" && ${jt_type[$parent_pos]} != "a" ]]; then
+						parent_pos=${jt_parent[$parent_pos]}
+					fi
+
 				# Starting char of primitive token, like (-)number, null, false, true and other
 				elif [[ "$ch" =~ [\-0-9tfn] ]]; then
 					#echo "primitive" 1>&2
-					if [[ $tok_sup -ne -1 ]]; then
-						if [[ ${jt_type[$tok_sup]} == "o" || \
-							${jt_type[$tok_sup]} == "s" && ${jt_size[$tok_sup]} -ne 0 ]]; then
+					if [[ $parent_pos -ne -1 ]]; then
+						if [[ ${jt_type[$parent_pos]} == "o" || \
+							${jt_type[$parent_pos]} == "s" && ${jt_size[$parent_pos]} -ne 0 ]]; then
 							JSON_LINE_ERROR=$line_ind
 							return $JSON_EXIT_ERROR_INVAL
 						fi
@@ -300,14 +339,19 @@ parse_json_from_pipe()
 					jt_type+=("p")
 					jt_content+=("$prim")
 					jt_size+=(0)
-					t_closed+=(1)
-					jt_parent+=($tok_sup)
+					jt_size_tok+=(1)
+					jt_parent+=($parent_pos)
 			
-					[[ $tok_sup -ne -1 ]] && jt_size[$tok_sup]=$(( ${jt_size[$tok_sup]} + 1 ))
+					if [[ $parent_pos -ne -1 ]]; then
+						jt_size[$parent_pos]=$(( ${jt_size[$parent_pos]} + 1 ))
+						jt_size_tok[$parent_pos]=$(( ${jt_size_tok[$parent_pos]} + 1 ))
+					fi
 
 					tok_pos=$(( $tok_pos + 1 ))
+
 				else
 					# Unexpected char
+					[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: unexpected char" 1>&2
 					JSON_LINE_ERROR=$line_ind
 					return $JSON_EXIT_ERROR_INVAL
 				fi
@@ -328,149 +372,260 @@ parse_json_from_pipe()
 	
 	# Error if comments block is not closed
 	if [[ "$skip_comments" != "0" ]]; then
+		[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: comments block is not closed" 1>&2
 		JSON_LINE_ERROR=$line_ind
 		return $JSON_EXIT_ERROR_PART
 	fi
 
 	# Verify that all opening brackets {[
 	# have corresponding closing brackets }].
-	local i=${#jt_type[@]}
-	i=$(( $i - 1 ))
-	while [[ $i -ge 0 ]]; do
-		if [[ ${t_closed[$i]} -eq 0 ]]; then
-			JSON_LINE_ERROR=$line_ind
-			return $JSON_EXIT_ERROR_PART
-		fi
-		i=$(( $i - 1 ))
-	done
+	if [[ ${#t_stack[@]} -gt 0 ]]; then
+		[[ $debug == true ]] && echo "DEBUG: PJFP: error in line $line_ind: [{ blocks does not closed" 1>&2
+		JSON_LINE_ERROR=$line_ind
+		return $JSON_EXIT_ERROR_PART
+	fi
+
 
 	return $JSON_EXIT_OK
 } # parse_json_from_pipe
 
 
 # Print parsed JSON tokens for debug purpose.
-# Output arrays jt_type, jt_content, jt_parent, jt_size
+# Output arrays jt_type, jt_content, jt_parent, jt_size and jt_size_tok
 # which allow to travers results in a binary tree manner.
 print_json_tokens()
 {
 	echo "JSON token count = ${#jt_type[@]}"
 	local i; for i in "${!jt_type[@]}"; do
-		#echo "index $i, type ${jt_type[$i]}"
-		if [[ "${jt_type[$i]}" == "o" ]]; then
-			echo "$i object parent ${jt_parent[$i]} size ${jt_size[$i]}"
-		elif [[ "${jt_type[$i]}" == "a" ]]; then
-			echo "$i array parent ${jt_parent[$i]} size ${jt_size[$i]}"
-		elif [[ "${jt_type[$i]}" == "s" ]]; then
-			local str="${jt_content[$i]}"
-			echo "$i \"${str}\" parent ${jt_parent[$i]} size ${jt_size[$i]}"
-		elif [[ "${jt_type[$i]}" == "p" ]]; then
-			local str="${jt_content[$i]}"
-			echo "$i |${str}| parent ${jt_parent[$i]} size ${jt_size[$i]}"
-		fi
+		str="$i $(print_json_token $i)"
+		echo "$str"
 	done
 } # print_json_tokens
 
+# Print JSON token by index specified in $1 for debug purpose.
+# Arguments:
+#	- JSON token index to get data from jt_type, jt_content, jt_parent, jt_size and jt_size_tok arrays
+print_json_token()
+{
+	local index="$1"
 
-# Jump to next parsed token item.
-# Do not use subshell to return result
-# to improve performance, but use
-# next_item_res variable instead.
+	if [[ $index -gt -1 ]]; then
+		if [[ "${jt_type[$index]}" == "o" ]]; then
+			echo -n "object parent ${jt_parent[$index]} size ${jt_size[$index]} size_ind ${jt_size_tok[$index]}"
+		elif [[ "${jt_type[$index]}" == "a" ]]; then
+			echo -n "array parent ${jt_parent[$index]} size ${jt_size[$index]} size_ind ${jt_size_tok[$index]}"
+		elif [[ "${jt_type[$index]}" == "s" ]]; then
+			local str="${jt_content[$index]}"
+			echo -n "\"${str}\" parent ${jt_parent[$index]} size ${jt_size[$index]} size_ind ${jt_size_tok[$index]}"
+		elif [[ "${jt_type[$index]}" == "p" ]]; then
+			local str="${jt_content[$index]}"
+			echo -n "|${str}| parent ${jt_parent[$index]} size ${jt_size[$index]} size_ind ${jt_size_tok[$index]}"
+		fi
+	else
+		echo -n "EOF"
+	fi
+} # print_json_token
+
+
+# Recursive function.
+# Searching for next token at same level as start index.
+# At the same time method fill array jt_size_tok for better indexing in next search requests.
+# Arguments:
+# 	- variable name to return found index of next token located at same level
+# 	- index position to start search
+# 	- debug switch on/off
 next_item()
 {
-	local i=$1
-	local size=${jt_size[$i]}
-	#echo "item $i size $size" 1>&2
+	declare -n output="$1"		# -n	make NAME a reference to the variable named by its value
+	local index=$2
+	local debug=$3
+	[[ $debug == true ]] && echo "DEBUG: NI: move to next from item $index $(print_json_token $index)" 1>&2
 
-	local k=$(( $i + 1 ))
-	if [[ $size -gt 0 ]]; then
-		local j=0
-		while [[ $j -lt $size ]]; do
-			next_item $k; k=$next_item_res
-			j=$(( $j + 1 ))
-		done
+	local sz_ind=${jt_size_tok[$index]}
+	if [[ $sz_ind -gt 0 ]]; then
+		index=$(( $index + $sz_ind ))
 	fi
-	#echo "Found next_item: $k" 1>&2
-	next_item_res=$k
+
+	if [[ $index -gt ${#jt_size[@]} ]]; then
+		output=-1
+		#return 1
+	else
+		output=$index
+		#return 0
+	fi
+	[[ $debug == true ]] && echo "DEBUG: NI: output=\"$output\"" 1>&2
+	[[ $debug == true ]] && echo "DEBUG: NI: found next_item $index $(print_json_token $index)" 1>&2
 } # next_item
 
 
 # Get token index with XML XPath style, where we have
 # array of entries [key1, key2 ... keyN] to search for JSON keys.
+# Arguments:
+# 	- variable name to return function result
+#	- XPath defined by all the following parameters to search
+# Return index of JSON element if XPath found, either -1 if no XPath found.
 get_json_path_index()
 {
-	local j=1
-	#echo "First ${!j}" 1>&2
-	local i=1
-	while [[ $i -lt ${#jt_type[@]} ]]; do
-		if [[ "${jt_type[$i]}" != "s" && "${jt_type[$i]}" != "a" ]]; then
-			echo "-1"
-			return
-		# Employ case insensitive compare with ^^
-		elif [[ "${jt_type[$i]}" == "s" && "${jt_content[$i]^^}" == "${!j^^}" ]]; then
-			#echo "Found ${!j}" 1>&2
-			j=$(( $j + 1 ))
-			if [[ $j -gt $# ]]; then
-				#echo "Stop on $i" 1>&2
-				echo $i
-				return
-			else
-				i=$(( $i + 1 ))
-				while [[ "${jt_type[$i]}" != "s" && "${jt_type[$i]}" != "a" ]]; do
-					i=$(( $i + 1 ))
-				done
-			fi
-		# If token is an array and search patern is an integer
-		elif [[ "${jt_type[$i]}" == "a" && "${!j}" =~ ^[0-9]+$ ]]; then
-			# If search index exceed array size, return error
-			if [[ ${!j} -ge ${jt_size[$i]} ]]; then
-				echo -1
-				return
-			fi
-			#echo "Search index array ${!j}" 1>&2
-			i=$(( $i + 1 ))
-			local k=0
-			while [[ $k -lt ${!j} ]]; do
-				#i=$(next_item $i)
-				next_item $i; i=$next_item_res
-				k=$(( $k + 1 ))
-			done
-			j=$(( $j + 1 ))
-			if [[ $j -gt $# ]]; then
-				#echo "Stop on $i" 1>&2
-				echo $i
-				return
-			else
-				while [[ "${jt_type[$i]}" != "s" && "${jt_type[$i]}" != "a" ]]; do
-					i=$(( $i + 1 ))
-				done
-				#echo "Found index $k on $i" 1>&2
-			fi
-		else
-			next_item $i; i=$next_item_res
-		fi
-	done
-	echo "-1"
+	declare -n output="$1"		# -n	make NAME a reference to the variable named by its value
+	local argss=("$@")
+	local search_keys=("${argss[@]:1}")
+	local start_index=0
+	get_json_path_index_internal "gjpii_res" ${start_index} ${search_keys[@]}
+	output=$gjpii_res
+	unset gjpii_res
 } # get_json_path_index
+
+# Recursive function.
+# Get token index with XML XPath style, where we have
+# array of entries [key1, key2 ... keyN] to search for JSON keys.
+# Arguments:
+# 	- variable name to return function result
+#	- index position to start search
+#	- XPath defined by all the following parameters to search
+# Return value contains index of found XPath, either -1 if no path found.
+get_json_path_index_internal()
+{
+	declare -n output="$1"		# -n	make NAME a reference to the variable named by its value
+	local argss=("$@")
+	local index=${argss[1]}
+	local search_keys=("${argss[@]:2}")
+	local search_val="${search_keys[0]}"
+	#local debug=true
+	#local debug_ni=true
+
+	if [[ "${jt_type[$index]}" == "o" ]]; then
+		local subtree_count=${jt_size[$index]}
+
+		index=$(( $index + 1 ))
+
+		local k=0
+		while [[ $k -lt $subtree_count ]]; do
+			if [[ "${jt_type[$index]}" == "s" && "${jt_content[$index]^^}" == "${search_val^^}" ]]; then
+				[[ $debug == true ]] && echo "DEBUG: GJPI: found ${search_val} at item ${index} $(print_json_token $index)" 1>&2
+
+				local search_keys2=("${search_keys[@]:1}")
+
+				if [[ ${#search_keys2[@]} -gt 0 ]]; then
+					# move to next level
+					local index2=$(( $index + 1 ))
+					get_json_path_index_internal "gjpii_res" $index2 ${search_keys2[@]}
+					index2=$gjpii_res
+					unset gjpii_res
+
+					if [[ $index2 -ne -1 ]]; then
+						output=$index2
+						return
+					fi
+				else
+					[[ $debug == true ]] && echo "DEBUG: GJPI: success!!!" 1>&2
+					output=$index
+					return
+				fi
+			fi
+		
+			#local output2	
+			next_item "gjpii_ni_res" $index $debug_ni
+			index=$gjpii_ni_res
+			unset gjpii_ni_res
+		
+			k=$(( $k + 1 ))
+		done
+		[[ $debug == true ]] && echo "DEBUG: GJPI: ${search_val} not found" 1>&2
+	elif [[ "${jt_type[$index]}" == "a" ]]; then
+		local subtree_count=${jt_size[$index]}
+		
+		if [[ ! "$search_val" =~ ^[0-9]+$ ]]; then
+			echo "ERROR: GJPI: key $search_val must be an integer value to index array at ${index}" 1>&2
+			output=-1
+			return
+		fi
+
+		if [[ $search_val -ge $subtree_count ]]; then
+			[[ $JSON_WARN_INVALID_PATH_INDEX == 1 ]] && echo "WARNING: GJPI: key $search_val exceed array at ${index} of size $subtree_count" 1>&2
+			output=-1
+			return
+		fi
+
+		local index2=$(( $index + 1 ))
+		local k=0
+		while [[ $k -lt ${search_val} ]]; do
+			#local output2
+			next_item "gjpii_ni_res" $index2 $debug_ni
+			index2=$gjpii_ni_res
+			unset gjpii_ni_res
+
+			k=$(( $k + 1 ))
+		done
+		
+		[[ $debug == true ]] && echo "DEBUG: GJPI: found ${search_val} at item ${index2} $(print_json_token $index2)" 1>&2
+
+		local search_keys2=("${search_keys[@]:1}")
+
+		if [[ ${#search_keys2[@]} -gt 0 ]]; then
+			# move to next level
+			get_json_path_index_internal "gjpii_res" $index2 ${search_keys2[@]}
+			index2=$gjpii_res
+			output=$index2
+			return
+		else
+			[[ $debug == true ]] && echo "DEBUG: GJPI: success!!!" 1>&2
+			output=$index2
+			return
+		fi
+	else
+		echo "ERROR: GJPI: search must start from object or array token position, but found $(print_json_token $index)" 1>&2
+		output=-1
+		return
+	fi
+
+	output=-1
+} # get_json_path_index_internal
+
 
 
 # Select value with XML XPath style, where we have
 # array of entries [key1, key2 ... keyN] to search for JSON keys.
 # Return corresponding key value, either array size for specific key.
+# Arguments:
+# 	- variable name to return function result
+#	- XPath defined by all the following parameters to search
+# Return JSON value if XPath found, either <empty> value if no XPath found.
 get_json_path_value()
 {
-	local i=$(get_json_path_index $@)
-	if [[ $i -ne -1 ]]; then
+	declare -n output="$1"		# -n	make NAME a reference to the variable named by its value
+	local argss=("$@")
+	local search_keys=("${argss[@]:1}")
+
+	get_json_path_index "gjpi_res" ${search_keys[@]}
+	local i=$gjpi_res
+	unset gjpi_res
+
+	#echo "DEBUG: GSPV: found index $i" 1>&2
+	if [[ $i -gt -1 ]]; then
 		# In case of key token prolong to next token
 		# (key token always has size > 0)
 		if [[ "${jt_type[$i]}" == "s" && "${jt_size[$i]}" -ne 0 ]]; then
 			i=$(( $i + 1 ))
 		fi
 		if [[ "${jt_type[$i]}" == "s" || "${jt_type[$i]}" == "p" ]]; then
-			echo -e "${jt_content[$i]}"
+			# set result to content value 
+			output=$(printf %b "${jt_content[$i]}")
+
+			#echo -e "${jt_content[$i]}"
 			return 0
 		elif [[ "${jt_type[$i]}" == "a" ]]; then
-			echo "${jt_size[$i]}"
+			# set result to array length
+			output=${jt_size[$i]}
+
+			#echo "${jt_size[$i]}"
 			return 0
+		fi
+	else
+		# set result to empty string, once no path found
+		output=""
+
+		if [[ $JSON_EVER_PARSED -eq 0 ]]; then
+			echo "ERROR: JSON source file must be processed first. Run parse_json or parse_json_from_pipe in advance" 1>&2
 		fi
 	fi
 	# Report that value doesn't found
@@ -478,7 +633,9 @@ get_json_path_value()
 } # get_json_path_value
 
 
-# Take JSON from file and send it to STDIN to parse with call to parse_json_from_pipe
+# Take JSON/JSONC from file and send it to STDIN to parse with call to parse_json_from_pipe
+# Arguments:
+# 	- path to file with JSON/JSONC to parse
 parse_json()
 {
 	local f=$1
@@ -486,7 +643,7 @@ parse_json()
 	if [[ $retval -ne $JSON_EXIT_OK ]]; then
 		local ret_desc; [[ $retval -eq $JSON_EXIT_ERROR_INVAL ]] && ret_desc="invalid character" || \
 			[[ $retval -eq $JSON_EXIT_ERROR_PART ]] && ret_desc="unexpected end" 
-		echo "Error $ret_desc at line $JSON_LINE_ERROR"
+		echo "ERROR $ret_desc at line $JSON_LINE_ERROR" 1>&2
 		return 1
 	fi
 } # parse_json

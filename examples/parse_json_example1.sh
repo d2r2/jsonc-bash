@@ -54,34 +54,36 @@ fi
 echo "----------------"
 echo "Parsing results:"
 echo "----------------"
-val=$(get_json_path_value "menu" "id")
-echo "- Select menu/id value = $val"
-val=$(get_json_path_value "menu" "type")
-echo "- Select menu/type value = $val"
-val=$(get_json_path_value "menu" "popup" "menuitem" 1 "args" 2)
-echo "- Select menu/popup/menuitem/1/args/2 value = $val"
-val=$(get_json_path_value "menu" "popup" "menuitem" 0 "args" 3)
-echo "- Select menu/popup/menuitem/0/args/3 value with unicode = $val"
+get_json_path_value "val" "menu" "id"
+echo "- Select menu/id value = \"$val\""
+get_json_path_value "val" "menu" "type"
+echo "- Select menu/type value = \"$val\""
+get_json_path_value "val" "menu" "popup" "menuitem" 1 "args" 2
+echo "- Select menu/popup/menuitem/1/args/2 value = \"$val\""
+get_json_path_value "val" "menu" "popup" "menuitem" 0 "args" 3
+echo "- Select menu/popup/menuitem/0/args/3 value with unicode = \"$val\""
 
 echo "- Iterate parsed JSON array menu/popup/menuitem to reconstruct function to call:"
 i=0
-c=$(get_json_path_value "menu" "popup" "menuitem")
-while [[ $i -lt $c ]]; do
-	v=$(get_json_path_value "menu" "popup" "menuitem" $i "value")
-	o=$(get_json_path_value "menu" "popup" "menuitem" $i "onclick")
+get_json_path_value "cnt" "menu" "popup" "menuitem"
+while [[ $i -lt $cnt ]]; do
+	get_json_path_value "item1" "menu" "popup" "menuitem" $i "value"
+	get_json_path_value "item2" "menu" "popup" "menuitem" $i "onclick"
 	j=0
-	cargs=$(get_json_path_value "menu" "popup" "menuitem" $i "args")
+	get_json_path_value "cargs" "menu" "popup" "menuitem" $i "args"
 	args=""
 	while [[ $j -lt $cargs ]]; do
-		#index="$(get_json_path_index 'menu' 'popup' 'menuitem' $i 'args' $j)"
+		#get_json_path_index "index" "menu" "popup" "menuitem" $i "args" $j
 		#echo "Item found at $index"
 		if [[ $args == "" ]]; then
-			args="arg${j}=$(get_json_path_value 'menu' 'popup' 'Menuitem' $i 'args' $j)"
+			get_json_path_value 'val' 'menu' 'popup' 'Menuitem' $i 'args' $j
+			args="\"$val\""
 		else
-			args="${args}, arg${j}=$(get_json_path_value 'menu' 'popup' 'menuitem' $i 'args' $j)"
+			get_json_path_value 'val' 'menu' 'popup' 'menuitem' $i 'args' $j
+			args="$args, \"$val\""
 		fi
 		j=$(( $j+1 ))
 	done
-	echo -e "\t* value=$v, func_to_call=$o($args)"
+	echo -e "\t* value=$item1, func_to_call=$item2($args)"
 	i=$(( $i+1 ))
 done
